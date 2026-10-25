@@ -11,6 +11,118 @@ index 7dee125..5395e77 100644
  SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+diff --git a/bsd/dev/herolte_ufs.c b/bsd/dev/herolte_ufs.c
+index 9b46983..bb50054 100644
+--- a/bsd/dev/herolte_ufs.c
++++ b/bsd/dev/herolte_ufs.c
+@@ -58,10 +58,17 @@ extern int hz;
+ #define REG_UTRLRSR     0x60
+ #define REG_VER         0x08
+ /* Exynos vendor HCI registers, 0x100 above the standard block. */
+-#define VS_TXPRDT_ENTRY_SIZE    0x100
+-#define VS_RXPRDT_ENTRY_SIZE    0x104
+-#define VS_UTRL_NEXUS_TYPE      0x140
++#if defined(ARM64_BOARD_CONFIG_STARLTE)
++/* Exynos 9810: vendor HCI at 0x11121100 (+0x1100), same layout as 8890. */
++#define VS_BASE                 0x1100
++#define HEROLTE_UFS_MAP         0x1300
++#else
++#define VS_BASE                 0x0
+ #define HEROLTE_UFS_MAP         0x300
++#endif
++#define VS_TXPRDT_ENTRY_SIZE    (VS_BASE + 0x100)
++#define VS_RXPRDT_ENTRY_SIZE    (VS_BASE + 0x104)
++#define VS_UTRL_NEXUS_TYPE      (VS_BASE + 0x140)
+ 
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+@@ -103,6 +110,7 @@ static struct {
+ 	uint8_t lun;
+ 	uint8_t sense_key, asc, ascq;     /* last CHECK CONDITION */
+ 	uint8_t tag;
++	uint32_t bounce_off;                    /* data offset in the bounce buffer */
+ 	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
+ 	uint32_t secsize;                       /* logical sector size for the BSD layer */
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+@@ -149,9 +157,9 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+-	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE + su.bounce_off;
+ 
+-	assert(len <= BOUNCE_SIZE);
++	assert(su.bounce_off + len <= BOUNCE_SIZE);
+ 	bzero(utrd, sizeof(*utrd));
+ 	bzero(ucd, sizeof(*ucd));
+ 
+@@ -196,9 +204,9 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	}
+ 	if (len) {
+ 		if (su.cache && write) {
+-			dma_clean(DMA_BOUNCE, len);
++			dma_clean(DMA_BOUNCE + su.bounce_off, len);
+ 		} else {
+-			dma_sync(DMA_BOUNCE, len);
++			dma_sync(DMA_BOUNCE + su.bounce_off, len);
+ 		}
+ 	}
+ 	__builtin_arm_dsb(0xf);
+@@ -244,7 +252,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		dma_sync(DMA_UCD, sizeof(*ucd));
+ 	}
+ 	if (len && !(su.cache && write)) {
+-		dma_sync(DMA_BOUNCE, len);
++		dma_sync(DMA_BOUNCE + su.bounce_off, len);
+ 	}
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
+@@ -270,12 +278,31 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+ 	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
+ 		return EINVAL;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_STARLTE)
++	if (lba + count - 1 > UINT32_MAX) {
++		return EINVAL;
++	}
++	int error = 0;
++	for (uint32_t i = 0; i < count && !error; i++) {
++		uint64_t b = lba + i;
++		uint8_t cdb[10] = {
++			0x28, 0,
++			(uint8_t)(b >> 24), (uint8_t)(b >> 16), (uint8_t)(b >> 8), (uint8_t)b,
++			0, 0, 1, 0
++		};
++		su.bounce_off = i * UFS_BLOCK;
++		error = ufs_scsi(cdb, sizeof(cdb), UFS_BLOCK, false);
++	}
++	su.bounce_off = 0;
++	return error;
++#else
+ 	uint8_t cdb[10] = {
+ 		0x28, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+ 		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+ 	};
+ 	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
++#endif
+ }
+ 
+ /*
+@@ -778,7 +805,13 @@ herolte_ufs_init(void)
+ 	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
+ 	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
++#if defined(ARM64_BOARD_CONFIG_STARLTE)
++	/* Read-only until the 9810 path is verified, whatever ufsrw says. */
++	su.writable = false;
++	(void)rw;
++#else
+ 	su.writable = (rw != 0);
++#endif
+ 	su.ready = true;
+ 	printf("HEROLTE UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
 diff --git a/config/MASTER.arm64.starlte b/config/MASTER.arm64.starlte
 new file mode 100644
 index 0000000..1b8de95
@@ -154,17 +266,26 @@ index 6d8a0fd..c046318 100644
  	fReal = herolte_fg_init() == 0;
  #else
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 10449ab..c4c0d2c 100644
+index 10449ab..6ccd312 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -771,7 +771,10 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -771,7 +771,19 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  		}
  	}
  
 -#if defined(ARM64_BOARD_CONFIG_A5XELTE)
 +#if defined(ARM64_BOARD_CONFIG_STARLTE)
 +	/* Exynos 9810: the A5/S7 keys, touch, PMIC and GPU code would drive
-+	 * other hardware at the same addresses; starlte drivers come later. */
++	 * other hardware at the same addresses; starlte drivers come later.
++	 * Boot-arg ufsprobe=1: read-only UFS host state and LUN 0 GPT. */
++	{
++	uint32_t ufsprobe = 0;
++	PE_parse_boot_argn("ufsprobe", &ufsprobe, sizeof(ufsprobe));
++	if (ufsprobe == 1) {
++		extern void herolte_ufs_probe(void);
++		herolte_ufs_probe();
++	}
++	}
 +#elif defined(ARM64_BOARD_CONFIG_A5XELTE)
  	/* GPIO keys: Exynos 7580 or, on HEROLTE, the Exynos 8890 ALIVE pins. */
  	a5xelte_keys_init();
